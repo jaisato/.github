@@ -1,0 +1,374 @@
+# Workflow reutilizable de CI para proyectos Symfony: composer validate, php -l,
+# php-cs-fixer, PHPStan, Rector (opcional), PHPUnit con MySQL/MariaDB y umbral de
+# cobertura, y composer audit.
+#
+# Lo invoca cada repositorio con:
+#   jobs:
+#     ci:
+#       uses: jaisato/.github/.github/workflows/symfony-ci.yml@main
+#       with: { working-directory: backend, mysql: true, coverage-min: 80 }
+#
+# Reglas de la casa:
+#   - Las entradas llegan a los scripts por `env`, nunca interpoladas con `${{ }}`
+#     dentro de `run:`.
+#   - Toda acción de terceros va anclada a un SHA (con la versión al lado).
+#   - Las credenciales de la base de datos son las de un contenedor que nace y
+#     muere con el job; van escritas por extenso para que ningún escáner de
+#     secretos las confunda con una credencial real.
+name: Symfony CI (reutilizable)
+
+on:
+  workflow_call:
+    inputs:
+      php-versions:
+        description: 'Lista JSON de versiones de PHP para la matriz de tests (p. ej. ["8.3", "8.4"]).'
+        type: string
+        default: '["8.3", "8.4"]'
+      tools-php-version:
+        description: "Versión de PHP para lint, análisis estático y auditoría. Por defecto, la primera de php-versions."
+        type: string
+        default: ""
+      working-directory:
+        description: "Directorio de la aplicación Symfony (donde está composer.json)."
+        type: string
+        default: "."
+      extensions:
+        description: "Extensiones de PHP para shivammathur/setup-php."
+        type: string
+        default: "intl, mbstring, pdo_mysql, pdo_sqlite, zip"
+      composer-options:
+        description: "Opciones de `composer install`."
+        type: string
+        default: "--no-interaction --no-progress --prefer-dist"
+      lint-paths:
+        description: "Directorios (separados por espacios) que recorre `php -l`; los que no existen se omiten."
+        type: string
+        default: "src tests config public tools"
+      cs-fixer:
+        description: "Ejecutar php-cs-fixer en modo dry-run."
+        type: boolean
+        default: true
+      phpstan:
+        description: "Ejecutar PHPStan (nivel y rutas según phpstan.dist.neon del proyecto)."
+        type: boolean
+        default: true
+      phpstan-args:
+        description: "Argumentos extra para `phpstan analyse`."
+        type: string
+        default: "--memory-limit=1G"
+      rector:
+        description: "Ejecutar Rector en modo dry-run."
+        type: boolean
+        default: false
+      pre-analysis-command:
+        description: "Comando previo al análisis estático (p. ej. `php bin/console cache:warmup --env=dev` para phpstan-symfony)."
+        type: string
+        default: ""
+      extra-lint-command:
+        description: "Comando adicional de lint tras el análisis (p. ej. `composer lint`)."
+        type: string
+        default: ""
+      mysql:
+        description: "Levantar un servicio MySQL/MariaDB para los tests y exportar DATABASE_URL."
+        type: boolean
+        default: false
+      mysql-image:
+        description: "Imagen del servicio de base de datos (mysql:8.0 o mariadb:11.4, por ejemplo)."
+        type: string
+        default: "mysql:8.0"
+      database-url:
+        description: >-
+          DATABASE_URL para el entorno de test. Vacío: mysql://app:app_ci_password@127.0.0.1:3306/app?serverVersion=8.0&charset=utf8mb4.
+          El usuario `app` tiene todos los privilegios, así que doctrine:database:create funciona con cualquier nombre.
+        type: string
+        default: ""
+      db-setup-command:
+        description: "Comando que prepara la base de datos de test (solo con mysql=true)."
+        type: string
+        default: >-
+          php bin/console doctrine:database:create --env=test --if-not-exists --no-interaction
+          && php bin/console doctrine:migrations:migrate --env=test --no-interaction --allow-no-migration
+      schema-validate:
+        description: "Comprobar que el esquema migrado coincide con los mappings (solo con mysql=true)."
+        type: boolean
+        default: true
+      coverage-min:
+        description: "Cobertura mínima de líneas (0 desactiva pcov y el umbral)."
+        type: number
+        default: 80
+      phpunit-args:
+        description: "Argumentos extra para PHPUnit."
+        type: string
+        default: ""
+      composer-audit:
+        description: "Ejecutar composer audit."
+        type: boolean
+        default: true
+      composer-audit-args:
+        description: "Argumentos de composer audit."
+        type: string
+        default: "--locked --abandoned=report"
+
+permissions: {}
+
+env:
+  COMPOSER_NO_INTERACTION: "1"
+
+jobs:
+  lint:
+    name: Lint y análisis estático
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ inputs.tools-php-version || fromJSON(inputs.php-versions)[0] }}
+          extensions: ${{ inputs.extensions }}
+          coverage: none
+          tools: composer:v2
+
+      - name: composer validate --strict
+        run: composer validate --strict
+
+      - name: Localizar la caché de Composer
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php${{ inputs.tools-php-version || fromJSON(inputs.php-versions)[0] }}-${{ hashFiles(format('{0}/composer.lock', inputs.working-directory)) }}
+          restore-keys: |
+            composer-${{ runner.os }}-php${{ inputs.tools-php-version || fromJSON(inputs.php-versions)[0] }}-
+
+      - name: composer install
+        env:
+          COMPOSER_OPTIONS: ${{ inputs.composer-options }}
+        run: |
+          read -ra opts <<< "$COMPOSER_OPTIONS"
+          composer install "${opts[@]}"
+
+      - name: Comando previo al análisis
+        if: inputs.pre-analysis-command != ''
+        env:
+          PRE_ANALYSIS_COMMAND: ${{ inputs.pre-analysis-command }}
+        run: bash -euo pipefail -c "$PRE_ANALYSIS_COMMAND"
+
+      - name: php-cs-fixer (dry-run)
+        if: inputs.cs-fixer
+        run: |
+          if [ ! -x vendor/bin/php-cs-fixer ]; then
+            echo "::error::cs-fixer=true pero vendor/bin/php-cs-fixer no existe (añade friendsofphp/php-cs-fixer a require-dev)"
+            exit 1
+          fi
+          vendor/bin/php-cs-fixer fix --dry-run --diff --verbose
+
+      - name: PHPStan
+        if: inputs.phpstan
+        env:
+          PHPSTAN_ARGS: ${{ inputs.phpstan-args }}
+        run: |
+          if [ ! -x vendor/bin/phpstan ]; then
+            echo "::error::phpstan=true pero vendor/bin/phpstan no existe (añade phpstan/phpstan a require-dev)"
+            exit 1
+          fi
+          read -ra extra <<< "$PHPSTAN_ARGS"
+          vendor/bin/phpstan analyse --no-progress "${extra[@]}"
+
+      - name: Rector (dry-run)
+        if: inputs.rector
+        run: |
+          if [ ! -x vendor/bin/rector ]; then
+            echo "::error::rector=true pero vendor/bin/rector no existe (añade rector/rector a require-dev)"
+            exit 1
+          fi
+          vendor/bin/rector process --dry-run --no-progress-bar
+
+      - name: Lint adicional
+        if: inputs.extra-lint-command != ''
+        env:
+          EXTRA_LINT_COMMAND: ${{ inputs.extra-lint-command }}
+        run: bash -euo pipefail -c "$EXTRA_LINT_COMMAND"
+
+  tests:
+    name: Tests (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(inputs.php-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    services:
+      # Con mysql=false la imagen queda vacía y el runner no arranca el servicio.
+      mysql:
+        image: ${{ inputs.mysql && inputs.mysql-image || '' }}
+        env:
+          MYSQL_ROOT_PASSWORD: root_ci_password
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app_ci_password
+          MYSQL_DATABASE: app_test
+        ports:
+          - 3306:3306
+        # mysql:* trae mysqladmin; mariadb:11+ solo mariadb-admin.
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot_ci_password || mariadb-admin ping -h 127.0.0.1 -uroot -proot_ci_password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      DATABASE_URL: ${{ inputs.mysql && (inputs.database-url || 'mysql://app:app_ci_password@127.0.0.1:3306/app?serverVersion=8.0&charset=utf8mb4') || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ${{ inputs.extensions }}
+          coverage: ${{ inputs.coverage-min > 0 && 'pcov' || 'none' }}
+          tools: composer:v2
+
+      # Antes de instalar nada y en cada versión de la matriz: un fichero que solo
+      # parsea en 8.4 es un bug aunque todo esté verde en la máquina del autor.
+      # grep encontrando algo distinto de "No syntax errors detected" es lo que
+      # invierte el `!`.
+      - name: Todo fichero PHP debe parsear en esta versión
+        env:
+          LINT_PATHS: ${{ inputs.lint-paths }}
+        run: |
+          read -ra candidates <<< "$LINT_PATHS"
+          dirs=()
+          for d in "${candidates[@]}"; do [ -d "$d" ] && dirs+=("$d"); done
+          if [ "${#dirs[@]}" -eq 0 ]; then echo "Sin directorios que analizar"; exit 0; fi
+          ! find "${dirs[@]}" -name '*.php' -exec php -l {} \; | grep -v '^No syntax errors detected'
+
+      - name: composer validate --strict
+        run: composer validate --strict
+
+      - name: Localizar la caché de Composer
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php${{ matrix.php }}-${{ hashFiles(format('{0}/composer.lock', inputs.working-directory)) }}
+          restore-keys: |
+            composer-${{ runner.os }}-php${{ matrix.php }}-
+
+      - name: composer install
+        env:
+          COMPOSER_OPTIONS: ${{ inputs.composer-options }}
+        run: |
+          read -ra opts <<< "$COMPOSER_OPTIONS"
+          composer install "${opts[@]}"
+
+      # El usuario `app` solo tiene permisos sobre app_test; con privilegios
+      # globales, doctrine:database:create funciona con el nombre que use el
+      # proyecto (p. ej. `app` + dbname_suffix `_test`). Nunca se ejecuta la
+      # aplicación como root.
+      - name: Conceder privilegios al usuario de la aplicación
+        if: inputs.mysql
+        env:
+          SERVICE_ID: ${{ job.services.mysql.id }}
+        run: |
+          printf '%s\n' "GRANT ALL PRIVILEGES ON *.* TO 'app'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;" \
+            | docker exec -i "$SERVICE_ID" sh -c 'if command -v mariadb >/dev/null 2>&1; then exec mariadb -uroot -proot_ci_password; else exec mysql -uroot -proot_ci_password; fi'
+
+      - name: Preparar la base de datos de test
+        if: inputs.mysql && inputs.db-setup-command != ''
+        env:
+          DB_SETUP_COMMAND: ${{ inputs.db-setup-command }}
+        run: bash -euo pipefail -c "$DB_SETUP_COMMAND"
+
+      - name: El esquema migrado debe coincidir con los mappings
+        if: inputs.mysql && inputs.schema-validate
+        run: php bin/console doctrine:schema:validate --env=test
+
+      - name: PHPUnit
+        env:
+          WITH_COVERAGE: ${{ inputs.coverage-min > 0 }}
+          PHPUNIT_ARGS: ${{ inputs.phpunit-args }}
+        run: |
+          if [ -x bin/phpunit ]; then phpunit=(php bin/phpunit); else phpunit=(vendor/bin/phpunit); fi
+          args=()
+          if [ "$WITH_COVERAGE" = "true" ]; then
+            mkdir -p var/coverage
+            args+=(--coverage-clover var/coverage/clover.xml --coverage-text)
+          fi
+          read -ra extra <<< "$PHPUNIT_ARGS"
+          "${phpunit[@]}" "${args[@]}" "${extra[@]}"
+
+      - name: Umbral de cobertura
+        if: inputs.coverage-min > 0
+        env:
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          cat > "$RUNNER_TEMP/coverage-threshold.php" <<'PHP'
+          <?php
+          declare(strict_types=1);
+          [$file, $minimum] = [$argv[1], (float) $argv[2]];
+          if (!is_file($file)) { fwrite(STDERR, "Informe Clover no encontrado: $file\n"); exit(2); }
+          $xml = simplexml_load_file($file);
+          if (false === $xml) { fwrite(STDERR, "No se puede leer el informe Clover: $file\n"); exit(2); }
+          $metrics = $xml->xpath('/coverage/project/metrics')[0] ?? null;
+          if (!$metrics instanceof SimpleXMLElement) { fwrite(STDERR, "El informe Clover no tiene métricas de proyecto\n"); exit(2); }
+          $statements = (int) $metrics['statements'];
+          $covered = (int) $metrics['coveredstatements'];
+          $percentage = $statements > 0 ? $covered / $statements * 100 : 100.0;
+          printf("Cobertura de líneas: %.2f%% (%d/%d sentencias), mínimo %.2f%%\n", $percentage, $covered, $statements, $minimum);
+          if ($percentage + 1e-9 < $minimum) { fwrite(STDERR, "La cobertura está por debajo del mínimo.\n"); exit(1); }
+          PHP
+          php "$RUNNER_TEMP/coverage-threshold.php" var/coverage/clover.xml "$COVERAGE_MIN"
+
+      - name: Publicar informe de cobertura
+        if: always() && inputs.coverage-min > 0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-php${{ matrix.php }}
+          path: ${{ inputs.working-directory }}/var/coverage/clover.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  audit:
+    name: composer audit
+    if: inputs.composer-audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: ${{ inputs.tools-php-version || fromJSON(inputs.php-versions)[0] }}
+          coverage: none
+          tools: composer:v2
+
+      # --locked lee composer.lock sin instalar nada. Un paquete abandonado se
+      # informa, no hace fallar el job: es una señal de mantenimiento, no un
+      # aviso de seguridad.
+      - name: composer audit
+        env:
+          COMPOSER_AUDIT_ARGS: ${{ inputs.composer-audit-args }}
+        run: |
+          read -ra extra <<< "$COMPOSER_AUDIT_ARGS"
+          composer audit "${extra[@]}"

@@ -1,0 +1,357 @@
+# Workflow reutilizable de CI para proyectos Python: ruff, mypy, pytest (con
+# cobertura mínima opcional), pip-audit y build de validación de la imagen Docker.
+#
+# Lo invoca cada repositorio con:
+#   jobs:
+#     ci:
+#       uses: jaisato/.github/.github/workflows/python-ci.yml@main
+#       with: { ... }
+#
+# Reglas de la casa:
+#   - Las entradas llegan a los scripts por `env`, nunca interpoladas con `${{ }}`
+#     dentro de `run:`: la interpolación ocurre antes de que el shell vea el texto.
+#   - Toda acción de terceros va anclada a un SHA (con la versión al lado, para
+#     que Dependabot la actualice). Una etiqueta se puede reescribir; un SHA no.
+name: Python CI (reutilizable)
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'Lista JSON de versiones de Python para la matriz de tests (p. ej. ["3.11", "3.12"]).'
+        type: string
+        default: '["3.12"]'
+      tools-python-version:
+        description: "Versión de Python para lint, tipos y auditoría. Por defecto, la primera de python-versions."
+        type: string
+        default: ""
+      working-directory:
+        description: "Directorio del proyecto Python (donde están pyproject.toml o los requirements)."
+        type: string
+        default: "."
+      install-command:
+        description: >-
+          Comando de instalación de dependencias. Si se deja el valor por defecto y no hay
+          pyproject.toml, se usan requirements-dev.lock, requirements-dev.txt o requirements.txt.
+        type: string
+        default: 'pip install -e ".[dev]"'
+      cache-dependency-path:
+        description: "Globs (uno por línea) cuyos ficheros forman la clave de la caché de pip."
+        type: string
+        default: |
+          **/pyproject.toml
+          **/requirements*.txt
+          **/requirements*.lock
+      ruff-paths:
+        description: "Rutas (separadas por espacios) que analiza ruff."
+        type: string
+        default: "."
+      ruff-format:
+        description: "Ejecutar también `ruff format --check`."
+        type: boolean
+        default: true
+      run-mypy:
+        description: "Ejecutar mypy."
+        type: boolean
+        default: false
+      mypy-paths:
+        description: "Rutas para mypy. Vacío: las que fije la configuración del proyecto (o `.` si no hay)."
+        type: string
+        default: ""
+      coverage-min:
+        description: "Cobertura mínima de líneas (0 desactiva la medición)."
+        type: number
+        default: 0
+      coverage-source:
+        description: "Paquete o ruta para `--cov=`. Vacío: `--cov` con la configuración del proyecto."
+        type: string
+        default: ""
+      extra-test-args:
+        description: "Argumentos extra para pytest."
+        type: string
+        default: ""
+      run-pip-audit:
+        description: "Ejecutar pip-audit."
+        type: boolean
+        default: false
+      pip-audit-args:
+        description: "Argumentos de pip-audit (p. ej. `-r requirements.lock`). Vacío: audita el entorno instalado."
+        type: string
+        default: ""
+      pip-audit-strict:
+        description: "Si es true, una vulnerabilidad hace fallar el job; si no, solo se avisa."
+        type: boolean
+        default: false
+      docker-build:
+        description: "Construir la imagen Docker sin publicarla, como validación."
+        type: boolean
+        default: false
+      docker-context:
+        description: "Contexto del build de Docker. Vacío: working-directory."
+        type: string
+        default: ""
+      dockerfile:
+        description: "Ruta del Dockerfile. Vacío: el Dockerfile del contexto."
+        type: string
+        default: ""
+
+permissions: {}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.tools-python-version || fromJSON(inputs.python-versions)[0] }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Instalar dependencias
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ ! -f pyproject.toml ] && [ "$INSTALL_COMMAND" = 'pip install -e ".[dev]"' ]; then
+            if [ -f requirements-dev.lock ]; then pip install -r requirements-dev.lock
+            elif [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+              if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            elif [ -f requirements.txt ]; then pip install -r requirements.txt
+            else
+              echo "::error::No hay pyproject.toml ni ficheros requirements; indica install-command"
+              exit 1
+            fi
+          else
+            bash -euo pipefail -c "$INSTALL_COMMAND"
+          fi
+          command -v ruff >/dev/null || pip install ruff
+
+      - name: ruff check
+        env:
+          RUFF_PATHS: ${{ inputs.ruff-paths }}
+        run: |
+          read -ra paths <<< "$RUFF_PATHS"
+          ruff check "${paths[@]}"
+
+      - name: ruff format --check
+        if: inputs.ruff-format
+        env:
+          RUFF_PATHS: ${{ inputs.ruff-paths }}
+        run: |
+          read -ra paths <<< "$RUFF_PATHS"
+          ruff format --check "${paths[@]}"
+
+  types:
+    name: Tipos (mypy)
+    if: inputs.run-mypy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.tools-python-version || fromJSON(inputs.python-versions)[0] }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Instalar dependencias
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ ! -f pyproject.toml ] && [ "$INSTALL_COMMAND" = 'pip install -e ".[dev]"' ]; then
+            if [ -f requirements-dev.lock ]; then pip install -r requirements-dev.lock
+            elif [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+              if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            elif [ -f requirements.txt ]; then pip install -r requirements.txt
+            else
+              echo "::error::No hay pyproject.toml ni ficheros requirements; indica install-command"
+              exit 1
+            fi
+          else
+            bash -euo pipefail -c "$INSTALL_COMMAND"
+          fi
+          command -v mypy >/dev/null || pip install mypy
+
+      - name: mypy
+        env:
+          MYPY_PATHS: ${{ inputs.mypy-paths }}
+        run: |
+          read -ra paths <<< "$MYPY_PATHS"
+          if [ "${#paths[@]}" -gt 0 ]; then
+            mypy "${paths[@]}"
+          elif grep -qsE '^\s*files\s*=' pyproject.toml mypy.ini setup.cfg 2>/dev/null; then
+            mypy
+          else
+            mypy .
+          fi
+
+  tests:
+    name: Tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Instalar dependencias
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+          WITH_COVERAGE: ${{ inputs.coverage-min > 0 }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ ! -f pyproject.toml ] && [ "$INSTALL_COMMAND" = 'pip install -e ".[dev]"' ]; then
+            if [ -f requirements-dev.lock ]; then pip install -r requirements-dev.lock
+            elif [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+              if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            elif [ -f requirements.txt ]; then pip install -r requirements.txt
+            else
+              echo "::error::No hay pyproject.toml ni ficheros requirements; indica install-command"
+              exit 1
+            fi
+          else
+            bash -euo pipefail -c "$INSTALL_COMMAND"
+          fi
+          python -c 'import pytest' 2>/dev/null || pip install pytest
+          if [ "$WITH_COVERAGE" = "true" ]; then
+            python -c 'import pytest_cov' 2>/dev/null || pip install pytest-cov
+          fi
+
+      - name: pytest
+        env:
+          WITH_COVERAGE: ${{ inputs.coverage-min > 0 }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+          COVERAGE_SOURCE: ${{ inputs.coverage-source }}
+          EXTRA_TEST_ARGS: ${{ inputs.extra-test-args }}
+        run: |
+          args=()
+          if [ "$WITH_COVERAGE" = "true" ]; then
+            args+=("--cov${COVERAGE_SOURCE:+=$COVERAGE_SOURCE}" --cov-report=term-missing --cov-report=xml "--cov-fail-under=$COVERAGE_MIN")
+          fi
+          read -ra extra <<< "$EXTRA_TEST_ARGS"
+          pytest "${args[@]}" "${extra[@]}"
+
+      - name: Publicar informe de cobertura
+        if: always() && inputs.coverage-min > 0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: ${{ inputs.working-directory }}/coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  audit:
+    name: Auditoría de dependencias (pip-audit)
+    if: inputs.run-pip-audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.tools-python-version || fromJSON(inputs.python-versions)[0] }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+      - name: Instalar dependencias (solo si se audita el entorno)
+        if: inputs.pip-audit-args == ''
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ ! -f pyproject.toml ] && [ "$INSTALL_COMMAND" = 'pip install -e ".[dev]"' ]; then
+            if [ -f requirements-dev.lock ]; then pip install -r requirements-dev.lock
+            elif [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+              if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            elif [ -f requirements.txt ]; then pip install -r requirements.txt
+            else
+              echo "::error::No hay pyproject.toml ni ficheros requirements; indica install-command"
+              exit 1
+            fi
+          else
+            bash -euo pipefail -c "$INSTALL_COMMAND"
+          fi
+
+      # Con pip-audit-strict=false una CVE sin parche aguas arriba no bloquea el
+      # resto del CI, pero queda visible como aviso en el job.
+      - name: pip-audit
+        continue-on-error: ${{ !inputs.pip-audit-strict }}
+        env:
+          PIP_AUDIT_ARGS: ${{ inputs.pip-audit-args }}
+        run: |
+          pip install pip-audit
+          read -ra extra <<< "$PIP_AUDIT_ARGS"
+          pip-audit --progress-spinner off "${extra[@]}"
+
+  docker:
+    name: Build de validación de la imagen (sin push)
+    if: inputs.docker-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.docker-context || inputs.working-directory }}
+          file: ${{ inputs.dockerfile }}
+          push: false
+          tags: ci-validation:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

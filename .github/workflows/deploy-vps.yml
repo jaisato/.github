@@ -1,0 +1,311 @@
+# Workflow reutilizable de despliegue a un VPS por SSH: `docker compose pull && up -d`,
+# comprobación de disponibilidad con reintentos y vuelta a la imagen anterior si falla.
+#
+# Lo invoca cada repositorio (normalmente tras publicar la imagen) con:
+#   jobs:
+#     deploy:
+#       uses: jaisato/.github/.github/workflows/deploy-vps.yml@main
+#       with:
+#         image: ghcr.io/jaisato/mi-servicio
+#         tag: ${{ needs.build-push.outputs.version }}
+#         compose-path: /opt/mi-servicio
+#         health-url: http://localhost:8010/health
+#       secrets:
+#         DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+#         DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+#         DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+#         DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+#
+# Decisiones de seguridad:
+#   - ssh nativo, sin acciones de terceros: la clave privada del VPS es el secreto
+#     más sensible del repositorio y no pasa por código ajeno.
+#   - La huella del servidor (DEPLOY_HOST_KEY) es obligatoria. No hay ssh-keyscan
+#     de respaldo: aceptar la huella en el primer contacto es aceptar la de
+#     cualquiera que esté en la ruta.
+#   - Secretos y entradas llegan a los scripts por `env`, nunca interpolados con
+#     `${{ }}` dentro de `run:`; y viajan al VPS escapados con printf %q tras
+#     validarse contra una expresión regular.
+#   - Solo `docker image prune -f` al terminar. Nunca `docker system prune`: en un
+#     VPS compartido borra volúmenes, redes y contenedores parados de otros
+#     servicios.
+name: Despliegue a VPS (reutilizable)
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Referencia de la imagen sin etiqueta (p. ej. ghcr.io/jaisato/normarag)."
+        type: string
+        required: true
+      tag:
+        description: "Etiqueta de la imagen a desplegar (latest, 1.2.0, sha-abc1234...)."
+        type: string
+        default: latest
+      tag-variable:
+        description: "Variable de entorno que el compose del VPS usa para la etiqueta (image: ${IMAGE}:${IMAGE_TAG:-latest})."
+        type: string
+        default: IMAGE_TAG
+      compose-path:
+        description: "Directorio del VPS que contiene el fichero compose (ruta absoluta o ~/...)."
+        type: string
+        required: true
+      compose-files:
+        description: "Valor de COMPOSE_FILE (ficheros separados por `:`). Vacío: los que Compose detecte."
+        type: string
+        default: ""
+      services:
+        description: "Servicios de compose a actualizar (separados por espacios). Vacío: todos."
+        type: string
+        default: ""
+      health-url:
+        description: "URL que debe responder 2xx, consultada desde el propio VPS (p. ej. http://localhost:8010/health)."
+        type: string
+        required: true
+      health-retries:
+        description: "Número de intentos de la comprobación de disponibilidad."
+        type: number
+        default: 30
+      health-interval:
+        description: "Segundos entre intentos."
+        type: number
+        default: 5
+      ssh-port:
+        description: "Puerto SSH del VPS."
+        type: string
+        default: "22"
+      wireguard:
+        description: "Levantar un túnel WireGuard (secreto WG_CONFIG) antes de conectar."
+        type: boolean
+        default: false
+      environment:
+        description: "Nombre del environment de GitHub (aprobaciones, secretos y URL)."
+        type: string
+        default: production
+    secrets:
+      DEPLOY_HOST:
+        description: "Host o IP del VPS (a través del túnel si wireguard=true)."
+        required: true
+      DEPLOY_USER:
+        description: "Usuario SSH."
+        required: true
+      DEPLOY_SSH_KEY:
+        description: "Clave privada SSH (OpenSSH, sin passphrase)."
+        required: true
+      DEPLOY_HOST_KEY:
+        description: "Huella del servidor en formato known_hosts (salida de `ssh-keyscan -t ed25519 <host>`)."
+        required: true
+      WG_CONFIG:
+        description: "Fichero de configuración de WireGuard (wg0.conf). Solo con wireguard=true."
+        required: false
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Desplegar ${{ inputs.image }}:${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    environment:
+      name: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-vps-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Validar entradas y secretos
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ inputs.tag }}
+          TAG_VARIABLE: ${{ inputs.tag-variable }}
+          COMPOSE_PATH: ${{ inputs.compose-path }}
+          COMPOSE_FILES: ${{ inputs.compose-files }}
+          SERVICES: ${{ inputs.services }}
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_RETRIES: ${{ inputs.health-retries }}
+          HEALTH_INTERVAL: ${{ inputs.health-interval }}
+          SSH_PORT: ${{ inputs.ssh-port }}
+          WIREGUARD: ${{ inputs.wireguard }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() { # nombre valor regex
+            if [[ ! "$2" =~ $3 ]]; then echo "::error::Entrada '$1' no válida"; fail=1; fi
+          }
+          # `[[ =~ ]]` valida la cadena entera; grep iría línea a línea y un valor
+          # con salto de línea ("latest" + una línea con un comando) pasaría el filtro.
+          check image          "$IMAGE"           '^[a-z0-9][a-z0-9._-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)*$'
+          check tag            "$TAG"             '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          check tag-variable   "$TAG_VARIABLE"    '^[A-Za-z_][A-Za-z0-9_]*$'
+          check compose-path   "$COMPOSE_PATH"    '^(/|~/)[A-Za-z0-9._/-]*$'
+          check compose-files  "$COMPOSE_FILES"   '^[A-Za-z0-9._/:-]*$'
+          check services       "$SERVICES"        '^[A-Za-z0-9._ -]*$'
+          check health-url     "$HEALTH_URL"      '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/?=&%-]*)?$'
+          check health-retries "$HEALTH_RETRIES"  '^[0-9]{1,4}$'
+          check health-interval "$HEALTH_INTERVAL" '^[0-9]{1,4}$'
+          check ssh-port       "$SSH_PORT"        '^[0-9]{1,5}$'
+          check DEPLOY_HOST    "$DEPLOY_HOST"     '^[A-Za-z0-9.:-]+$'
+          check DEPLOY_USER    "$DEPLOY_USER"     '^[a-z_][a-z0-9_-]{0,31}$'
+          for s in DEPLOY_SSH_KEY DEPLOY_HOST_KEY; do
+            if [ -z "${!s}" ]; then echo "::error::Falta el secreto $s"; fail=1; fi
+          done
+          if [ "$WIREGUARD" = "true" ] && [ -z "$WG_CONFIG" ]; then
+            echo "::error::wireguard=true pero falta el secreto WG_CONFIG"; fail=1
+          fi
+          exit "$fail"
+
+      - name: Levantar túnel WireGuard
+        if: inputs.wireguard
+        env:
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y --no-install-recommends wireguard-tools >/dev/null
+          printf '%s\n' "$WG_CONFIG" | sudo install -m 600 /dev/stdin /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+          ping -c 2 -W 3 "$DEPLOY_HOST" || echo "::warning::El host no responde a ping (puede estar filtrado)"
+
+      - name: Preparar SSH (clave y huella del servidor)
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_PORT: ${{ inputs.ssh-port }}
+        run: |
+          set -euo pipefail
+          SSH_DIR="$RUNNER_TEMP/ssh"
+          umask 077
+          mkdir -p "$SSH_DIR"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$SSH_DIR/id_deploy"
+          # Se admite la línea completa de known_hosts o solo "tipo clave"; en el
+          # segundo caso se antepone el host (con [host]:puerto si no es el 22).
+          if [ "$SSH_PORT" = "22" ]; then hostpat="$DEPLOY_HOST"; else hostpat="[$DEPLOY_HOST]:$SSH_PORT"; fi
+          : > "$SSH_DIR/known_hosts"
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in
+              ssh-*|ecdsa-*|sk-*) printf '%s %s\n' "$hostpat" "$line" ;;
+              *) printf '%s\n' "$line" ;;
+            esac
+          done <<< "$DEPLOY_HOST_KEY" >> "$SSH_DIR/known_hosts"
+          cat > "$SSH_DIR/config" <<EOF
+          Host vps
+            HostName $DEPLOY_HOST
+            Port $SSH_PORT
+            IdentityFile $SSH_DIR/id_deploy
+            IdentitiesOnly yes
+            UserKnownHostsFile $SSH_DIR/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 20
+            ServerAliveInterval 30
+            ServerAliveCountMax 4
+          EOF
+
+      - name: Desplegar (compose pull + up, comprobación y rollback)
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ inputs.tag }}
+          TAG_VARIABLE: ${{ inputs.tag-variable }}
+          COMPOSE_PATH: ${{ inputs.compose-path }}
+          COMPOSE_FILES: ${{ inputs.compose-files }}
+          SERVICES: ${{ inputs.services }}
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_RETRIES: ${{ inputs.health-retries }}
+          HEALTH_INTERVAL: ${{ inputs.health-interval }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          SSH_DIR="$RUNNER_TEMP/ssh"
+          script="$RUNNER_TEMP/remote-deploy.sh"
+          # Cabecera con los valores ya validados, escapados para el shell remoto.
+          {
+            printf 'IMAGE=%q\n' "$IMAGE"
+            printf 'TAG=%q\n' "$TAG"
+            printf 'TAG_VARIABLE=%q\n' "$TAG_VARIABLE"
+            printf 'COMPOSE_PATH=%q\n' "$COMPOSE_PATH"
+            printf 'COMPOSE_FILES=%q\n' "$COMPOSE_FILES"
+            printf 'SERVICES_STR=%q\n' "$SERVICES"
+            printf 'HEALTH_URL=%q\n' "$HEALTH_URL"
+            printf 'HEALTH_RETRIES=%q\n' "$HEALTH_RETRIES"
+            printf 'HEALTH_INTERVAL=%q\n' "$HEALTH_INTERVAL"
+            cat <<'REMOTE'
+          set -euo pipefail
+          cd "${COMPOSE_PATH/#\~/$HOME}"
+          if [ -n "$COMPOSE_FILES" ]; then export COMPOSE_FILE="$COMPOSE_FILES"; fi
+          export "$TAG_VARIABLE=$TAG"
+          read -ra SERVICES <<< "$SERVICES_STR"
+
+          echo "::group::Imagen en ejecución antes del despliegue"
+          prev_ref=""; prev_id=""
+          for cid in $(docker compose ps -q "${SERVICES[@]}" 2>/dev/null); do
+            ref=$(docker inspect --format '{{.Config.Image}}' "$cid")
+            case "$ref" in
+              "$IMAGE"|"$IMAGE":*)
+                prev_ref="$ref"
+                prev_id=$(docker inspect --format '{{.Image}}' "$cid")
+                break ;;
+            esac
+          done
+          echo "Anterior: ${prev_ref:-ninguna} ${prev_id:+($prev_id)}"
+          echo "::endgroup::"
+
+          echo "::group::docker compose pull && up -d ($IMAGE:$TAG)"
+          docker compose pull "${SERVICES[@]}"
+          docker compose up -d "${SERVICES[@]}"
+          echo "::endgroup::"
+
+          ok=""
+          for i in $(seq 1 "$HEALTH_RETRIES"); do
+            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
+              ok=1; echo "Servicio disponible tras $i intento(s)"; break
+            fi
+            sleep "$HEALTH_INTERVAL"
+          done
+
+          if [ -z "$ok" ]; then
+            echo "::error::$HEALTH_URL no respondió tras $HEALTH_RETRIES intentos"
+            echo "::group::Últimas líneas de log"
+            docker compose logs --tail 100 "${SERVICES[@]}" || true
+            echo "::endgroup::"
+            if [ -n "$prev_id" ]; then
+              echo "::group::Rollback a $prev_ref ($prev_id)"
+              prev_tag="${prev_ref#"$IMAGE":}"
+              if [ "$prev_tag" = "$prev_ref" ]; then prev_tag=latest; fi
+              # La misma referencia que usaba compose vuelve a apuntar a la imagen
+              # anterior (por si el pull la sobrescribió) y se recrean los servicios.
+              docker tag "$prev_id" "$prev_ref"
+              export "$TAG_VARIABLE=$prev_tag"
+              docker compose up -d "${SERVICES[@]}"
+              for i in $(seq 1 "$HEALTH_RETRIES"); do
+                if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
+                  echo "Rollback verificado tras $i intento(s)"; break
+                fi
+                sleep "$HEALTH_INTERVAL"
+              done
+              echo "::endgroup::"
+            else
+              echo "::warning::No había imagen anterior a la que volver"
+            fi
+            exit 1
+          fi
+
+          # Solo imágenes colgantes; nunca `system prune` en un VPS compartido.
+          docker image prune -f >/dev/null
+          echo "Despliegue de $IMAGE:$TAG completado"
+          REMOTE
+          } > "$script"
+          ssh -F "$SSH_DIR/config" "$DEPLOY_USER@vps" 'bash -s' < "$script"
+
+      - name: Limpiar clave y túnel
+        if: always()
+        env:
+          WIREGUARD: ${{ inputs.wireguard }}
+        run: |
+          rm -rf "$RUNNER_TEMP/ssh" "$RUNNER_TEMP/remote-deploy.sh"
+          if [ "$WIREGUARD" = "true" ]; then sudo wg-quick down wg0 || true; fi
