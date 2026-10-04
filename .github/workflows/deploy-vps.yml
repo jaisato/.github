@@ -1,5 +1,8 @@
 # Workflow reutilizable de despliegue a un VPS por SSH: `docker compose pull && up -d`,
-# comprobación de disponibilidad con reintentos y vuelta a la imagen anterior si falla.
+# comprobación de disponibilidad con reintentos y vuelta a la imagen anterior si
+# falla el `up -d` o la comprobación. La versión que queda en ejecución se fija en
+# el VPS (`:latest` local y $COMPOSE_PATH/.deploy-image-tag) para que un
+# `docker compose up -d` manual posterior no vuelva a una imagen antigua.
 #
 # Lo invoca cada repositorio (normalmente tras publicar la imagen) con:
 #   jobs:
@@ -240,63 +243,167 @@ jobs:
           if [ -n "$COMPOSE_FILES" ]; then export COMPOSE_FILE="$COMPOSE_FILES"; fi
           export "$TAG_VARIABLE=$TAG"
           read -ra SERVICES <<< "$SERVICES_STR"
+          # Fichero propio del despliegue con la etiqueta en ejecución. El .env del
+          # usuario no se toca.
+          TAG_FILE=.deploy-image-tag
 
-          echo "::group::Imagen en ejecución antes del despliegue"
-          prev_ref=""; prev_id=""
+          # Repositorios que despliega el job: los de las imágenes de los servicios
+          # cuya referencia depende de $TAG_VARIABLE (p. ej. las cinco de agentmesh
+          # con AM_IMAGE_TAG, aunque `image` solo nombre una). Se resuelve el compose
+          # con la etiqueta y con otra de prueba y se comparan: una imagen ajena que
+          # casualmente tenga la misma etiqueta (redis:7-alpine con tag=7-alpine) no
+          # cambia y queda fuera. Si `config --images` falla, solo $IMAGE.
+          images_for() { env "$TAG_VARIABLE=$1" docker compose config --images "${SERVICES[@]}" 2>/dev/null | sort -u; }
+          probe=deploy-vps-probe; [ "$TAG" != "$probe" ] || probe=deploy-vps-probe-2
+          repos=()
+          if with_tag=$(images_for "$TAG") && with_probe=$(images_for "$probe"); then
+            while IFS= read -r ref; do
+              case "$ref" in *:"$TAG") ;; *) continue ;; esac
+              grep -qxF -- "$ref" <<< "$with_probe" || repos+=("${ref%:"$TAG"}")
+            done <<< "$with_tag"
+            case " ${repos[*]} " in
+              *" $IMAGE "*) ;;
+              *) if [ "$TAG" != latest ]; then
+                   echo "::warning::El compose no resuelve $IMAGE con \${$TAG_VARIABLE}: no se despliega $IMAGE:$TAG"
+                 fi ;;
+            esac
+          else
+            repos=("$IMAGE")
+          fi
+
+          # repo_tag REF: si REF es de un repositorio desplegado (o de $IMAGE),
+          # imprime "repositorio etiqueta".
+          repo_tag() {
+            local r
+            for r in "${repos[@]}" "$IMAGE"; do
+              case "$1" in
+                "$r") echo "$r latest"; return 0 ;;
+                "$r":*) echo "$r ${1#"$r":}"; return 0 ;;
+              esac
+            done
+            return 1
+          }
+
+          healthy() {
+            local i
+            for i in $(seq 1 "$HEALTH_RETRIES"); do
+              if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
+                echo "$HEALTH_URL responde tras $i intento(s)"; return 0
+              fi
+              sleep "$HEALTH_INTERVAL"
+            done
+            return 1
+          }
+
+          # Escritura atómica. Si no se puede (permisos), solo un aviso.
+          write_tag_file() {
+            if printf '%s\n' "$1" > "$TAG_FILE.tmp" && mv -f "$TAG_FILE.tmp" "$TAG_FILE"; then
+              echo "$PWD/$TAG_FILE: $1"
+            else
+              rm -f "$TAG_FILE.tmp"
+              echo "::warning::No se pudo escribir $PWD/$TAG_FILE"
+            fi
+          }
+
+          echo "::group::Imágenes en ejecución antes del despliegue"
+          echo "Repositorios desplegados: ${repos[*]:-ninguno}"
+          # "referencia id" de cada contenedor de los servicios: el estado al que
+          # vuelve el rollback.
+          prev=(); prev_ref=""; prev_id=""; prev_tag=""
           for cid in $(docker compose ps -q "${SERVICES[@]}" 2>/dev/null); do
             ref=$(docker inspect --format '{{.Config.Image}}' "$cid")
-            case "$ref" in
-              "$IMAGE"|"$IMAGE":*)
-                prev_ref="$ref"
-                prev_id=$(docker inspect --format '{{.Image}}' "$cid")
-                break ;;
-            esac
+            id=$(docker inspect --format '{{.Image}}' "$cid")
+            prev+=("$ref $id")
+            echo "$ref ($id)"
+            if [ -z "$prev_id" ] && rt=$(repo_tag "$ref"); then
+              prev_ref="$ref"; prev_id="$id"; prev_tag="${rt#* }"
+            fi
           done
           echo "Anterior: ${prev_ref:-ninguna} ${prev_id:+($prev_id)}"
           echo "::endgroup::"
 
-          echo "::group::docker compose pull && up -d ($IMAGE:$TAG)"
-          docker compose pull "${SERVICES[@]}"
-          docker compose up -d "${SERVICES[@]}"
-          echo "::endgroup::"
+          # Cada referencia anterior vuelve a apuntar a la imagen con la que corría
+          # su contenedor (el pull puede haberla movido, p. ej. con tag=latest) y esa
+          # versión queda fijada como :latest local y en $TAG_FILE. No toca
+          # contenedores.
+          restore_previous_tags() {
+            local entry ref id rt
+            for entry in "${prev[@]}"; do
+              ref="${entry% *}"; id="${entry#* }"
+              docker tag "$id" "$ref" || echo "::warning::No se pudo volver a etiquetar $ref"
+              if rt=$(repo_tag "$ref"); then
+                docker tag "$id" "${rt% *}:latest" || echo "::warning::No se pudo fijar ${rt% *}:latest"
+              fi
+            done
+            if [ -n "$prev_tag" ]; then write_tag_file "$prev_tag"; fi
+          }
 
-          ok=""
-          for i in $(seq 1 "$HEALTH_RETRIES"); do
-            if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
-              ok=1; echo "Servicio disponible tras $i intento(s)"; break
-            fi
-            sleep "$HEALTH_INTERVAL"
-          done
-
-          if [ -z "$ok" ]; then
-            echo "::error::$HEALTH_URL no respondió tras $HEALTH_RETRIES intentos"
+          # Vuelve a la versión anterior y termina en error. Se llama si falla el
+          # `up -d` (también a medias, con el contenedor viejo ya borrado) o la
+          # comprobación de disponibilidad.
+          rollback() {
             echo "::group::Últimas líneas de log"
             docker compose logs --tail 100 "${SERVICES[@]}" || true
             echo "::endgroup::"
-            if [ -n "$prev_id" ]; then
-              echo "::group::Rollback a $prev_ref ($prev_id)"
-              prev_tag="${prev_ref#"$IMAGE":}"
-              if [ "$prev_tag" = "$prev_ref" ]; then prev_tag=latest; fi
-              # La misma referencia que usaba compose vuelve a apuntar a la imagen
-              # anterior (por si el pull la sobrescribió) y se recrean los servicios.
-              docker tag "$prev_id" "$prev_ref"
-              export "$TAG_VARIABLE=$prev_tag"
-              docker compose up -d "${SERVICES[@]}"
-              for i in $(seq 1 "$HEALTH_RETRIES"); do
-                if curl -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; then
-                  echo "Rollback verificado tras $i intento(s)"; break
-                fi
-                sleep "$HEALTH_INTERVAL"
-              done
+            if [ -z "$prev_id" ]; then
+              echo "::warning::No había imagen anterior a la que volver"
+              exit 1
+            fi
+            echo "::group::Rollback a $prev_ref ($prev_id)"
+            restore_previous_tags
+            export "$TAG_VARIABLE=$prev_tag"
+            if docker compose up -d "${SERVICES[@]}" && healthy; then
+              echo "Rollback verificado: en ejecución $prev_ref"
               echo "::endgroup::"
             else
-              echo "::warning::No había imagen anterior a la que volver"
+              echo "::endgroup::"
+              echo "::error::El rollback a $prev_ref no responde en $HEALTH_URL; revisa el VPS"
             fi
             exit 1
+          }
+
+          echo "::group::docker compose pull ($TAG_VARIABLE=$TAG)"
+          if ! docker compose pull "${SERVICES[@]}"; then
+            echo "::endgroup::"
+            echo "::error::docker compose pull falló; no se ha tocado ningún contenedor"
+            restore_previous_tags
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::docker compose up -d ($TAG_VARIABLE=$TAG)"
+          if ! docker compose up -d "${SERVICES[@]}"; then
+            echo "::endgroup::"
+            echo "::error::docker compose up -d falló"
+            rollback
+          fi
+          echo "::endgroup::"
+
+          if ! healthy; then
+            echo "::error::$HEALTH_URL no respondió tras $HEALTH_RETRIES intentos"
+            rollback
           fi
 
+          # Fija lo desplegado: un `docker compose up -d` manual sin $TAG_VARIABLE
+          # (image: ...:${IMAGE_TAG:-latest}) usa :latest local, que ya no es una
+          # versión anterior. Con tag=latest no hay nada que reetiquetar: el pull
+          # ya lo dejó así.
+          echo "::group::Fijar $TAG como versión desplegada"
+          if [ "$TAG" != latest ]; then
+            for r in "${repos[@]}"; do
+              if docker tag "$r:$TAG" "$r:latest"; then
+                echo "$r:latest -> $r:$TAG"
+              else
+                echo "::warning::No se pudo etiquetar $r:$TAG como $r:latest"
+              fi
+            done
+          fi
+          # Si ninguna imagen usa la variable, lo desplegado no es $TAG (ya avisado).
+          if [ "${#repos[@]}" -gt 0 ] || [ "$TAG" = latest ]; then write_tag_file "$TAG"; fi
+          echo "::endgroup::"
+
           # Solo imágenes colgantes; nunca `system prune` en un VPS compartido.
-          docker image prune -f >/dev/null
+          docker image prune -f >/dev/null || echo "::warning::docker image prune -f falló"
           echo "Despliegue de $IMAGE:$TAG completado"
           REMOTE
           } > "$script"

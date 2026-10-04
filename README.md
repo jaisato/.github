@@ -9,7 +9,7 @@ mantiene en un único sitio.
 |---|---|---|
 | `python-ci` | ruff, mypy, pytest con cobertura mínima, pip-audit, build de la imagen Docker | [`.github/workflows/python-ci.yml`](.github/workflows/python-ci.yml) |
 | `symfony-ci` | composer validate, `php -l`, php-cs-fixer, PHPStan, Rector, PHPUnit con MySQL/MariaDB y umbral de cobertura, composer audit | [`.github/workflows/symfony-ci.yml`](.github/workflows/symfony-ci.yml) |
-| `deploy-vps` | despliegue por SSH a un VPS: `docker compose pull && up -d`, comprobación con reintentos y rollback | [`.github/workflows/deploy-vps.yml`](.github/workflows/deploy-vps.yml) |
+| `deploy-vps` | despliegue por SSH a un VPS: `docker compose pull && up -d`, comprobación con reintentos, rollback y versión desplegada fijada en el VPS | [`.github/workflows/deploy-vps.yml`](.github/workflows/deploy-vps.yml) |
 
 El repositorio es público porque un workflow reutilizable solo puede invocarse
 desde un repositorio privado si vive en un repositorio público (o en la misma
@@ -176,18 +176,86 @@ Un único job `deploy` que:
 2. levanta un túnel WireGuard si `wireguard: true` (secreto `WG_CONFIG`);
 3. escribe la clave y la huella del servidor y conecta con ssh nativo
    (`StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `BatchMode yes`);
-4. en el VPS: anota la imagen en ejecución, `docker compose pull && up -d`,
-   consulta `health-url` con reintentos y, si no responde, vuelve a la imagen
-   anterior (`docker tag` + `up -d`) y falla el job;
-5. si todo va bien, `docker image prune -f` (nunca `docker system prune`, que en
-   un VPS compartido borra volúmenes y contenedores de otros servicios);
-6. borra la clave y cierra el túnel (`if: always()`).
+4. en el VPS: anota la imagen de cada contenedor de los servicios y hace
+   `docker compose pull`. Si el pull falla, el job termina en error sin tocar
+   ningún contenedor;
+5. `docker compose up -d` y consulta `health-url` con reintentos. Si el `up -d`
+   falla (también a medias, con el contenedor viejo ya borrado) o la URL no
+   responde, vuelve a la versión anterior ([rollback](#rollback)) y falla el job;
+6. si todo va bien, fija la versión desplegada en el VPS ([qué queda en el
+   VPS](#qué-queda-en-el-vps)) y hace `docker image prune -f` (nunca
+   `docker system prune`, que en un VPS compartido borra volúmenes y
+   contenedores de otros servicios);
+7. borra la clave y cierra el túnel (`if: always()`).
 
 La etiqueta se exporta al entorno de compose como `IMAGE_TAG` (configurable con
 `tag-variable`), así que el fichero compose del VPS debería referenciar la
-imagen como `image: ghcr.io/jaisato/mi-servicio:${IMAGE_TAG:-latest}`. Con un
-`:latest` fijo también funciona: el rollback vuelve a etiquetar la imagen
-anterior con esa misma referencia.
+imagen como `image: ghcr.io/jaisato/mi-servicio:${IMAGE_TAG:-latest}`: ese
+`latest` por defecto es lo que hace que un `up -d` manual sin la variable use
+la versión desplegada. Con un `:latest` fijo (y `tag: latest`) también
+funciona: el rollback vuelve a etiquetar la imagen anterior con esa misma
+referencia.
+
+### Qué queda en el VPS
+
+Tras desplegar `tag: 1.2.0` con éxito:
+
+- los servicios corren `ghcr.io/jaisato/mi-servicio:1.2.0`;
+- `ghcr.io/jaisato/mi-servicio:latest` **local** apunta a esa misma imagen
+  (`docker tag …:1.2.0 …:latest`). En el VPS, `:latest` significa «lo
+  desplegado», no «lo último publicado en el registro»;
+- `$COMPOSE_PATH/.deploy-image-tag` contiene `1.2.0`. Es un fichero propio del
+  despliegue (escritura atómica; si no se puede escribir, solo un aviso): el
+  workflow no toca el `.env`;
+- la imagen anterior sigue etiquetada (`:1.1.0`) y es a la que vuelve el
+  rollback. `docker image prune -f` solo borra imágenes colgantes, así que las
+  versiones antiguas se acumulan: bórralas a mano
+  (`docker image rm ghcr.io/jaisato/mi-servicio:1.0.0`) cuando ya no las
+  quieras para volver atrás.
+
+Se reetiquetan todas las imágenes de los servicios cuya referencia depende de
+`tag-variable`, no solo `image`: el workflow resuelve el compose con la
+etiqueta y con otra de prueba (`docker compose config --images`) y compara. En
+agentmesh, por ejemplo, las cinco imágenes que comparten `AM_IMAGE_TAG`; una
+imagen ajena que casualmente tenga la misma etiqueta (`redis:7-alpine` con
+`tag: 7-alpine`) no se toca. Si `config --images` no está disponible, solo se
+reetiqueta `image`. Con `tag: latest` no hay nada que reetiquetar: el pull ya
+deja `:latest` en la versión desplegada.
+
+### Rollback
+
+- **Falla el `up -d` o la comprobación**: cada referencia que usaban los
+  contenedores de los servicios (`services`, o todos) vuelve a apuntar a la
+  imagen exacta con la que corrían (por si
+  el pull la movió, p. ej. con `tag: latest`); `:latest` local y
+  `.deploy-image-tag` pasan a la versión restaurada; se recrean los servicios
+  con la etiqueta anterior y se vuelve a consultar `health-url`. El job falla
+  igualmente, y si el rollback tampoco responde lo indica con un error aparte.
+- **Falla el pull**: no se toca ningún contenedor; las etiquetas locales
+  vuelven a apuntar a lo que está en ejecución y el job falla.
+- **Primer despliegue** (sin contenedores anteriores): no hay a qué volver; el
+  job falla con un aviso y los servicios quedan como los haya dejado el `up -d`.
+
+### Operar a mano en el VPS
+
+```bash
+cd /opt/mi-servicio
+cat .deploy-image-tag        # versión desplegada
+# Tras cambiar el .env, las dos usan la versión desplegada:
+docker compose up -d         # vía :latest local; recrea los servicios de la imagen (misma versión)
+IMAGE_TAG="$(cat .deploy-image-tag)" docker compose up -d   # no recrea lo que no ha cambiado
+```
+
+- Usa la variable de `tag-variable` (`AM_IMAGE_TAG` en agentmesh) y, si el
+  despliegue pasa `compose-files`, exporta también `COMPOSE_FILE` (p. ej.
+  `COMPOSE_FILE=compose.yaml:compose.prod.yaml`).
+- No hagas `docker compose pull` sin exportar la etiqueta: descargaría
+  `:latest` del registro y movería el `:latest` local a una versión que no se
+  ha desplegado ni comprobado.
+- Para cambiar de versión o volver a una anterior, relanza el despliegue del
+  repositorio con esa etiqueta (p. ej. su `workflow_dispatch`) en vez de
+  hacerlo a mano: comprueba la salud, hace rollback si hace falta y deja
+  `:latest` y `.deploy-image-tag` coherentes.
 
 ### Entradas
 
