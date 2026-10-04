@@ -1,4 +1,6 @@
-# Valida los workflows de este repositorio con actionlint (+ shellcheck).
+# Valida los workflows de este repositorio con actionlint (+ shellcheck) y prueba
+# la lógica de despliegue de deploy-vps con ssh, docker y curl falsos
+# (tests/deploy-vps).
 name: Lint de workflows
 
 on:
@@ -26,3 +28,21 @@ jobs:
       # revisar los scripts de cada `run:`.
       - name: actionlint
         run: pipx run --spec 'actionlint-py==1.7.12.25' actionlint -no-color .github/workflows/*.yml
+
+  deploy-vps-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck de las pruebas
+        run: shellcheck tests/deploy-vps/run.sh tests/deploy-vps/fake-bin/*
+
+      # Ejecuta el script del paso de despliegue de deploy-vps.yml tal cual, con
+      # el docker falso: despliegue correcto, health KO, `up -d` KO, pull KO,
+      # tag=latest y varias imágenes con la misma variable de etiqueta.
+      - name: Escenarios de deploy-vps
+        run: bash tests/deploy-vps/run.sh

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# curl falso para tests/deploy-vps/run.sh: la URL de salud responde 2xx solo si
+# el contenedor del servicio de $FAKE_STATE/health_service corre una imagen de
+# $FAKE_STATE/healthy. Sin contenedor, conexión rechazada (7); con una imagen
+# que no está en la lista, error HTTP con -f (22).
+set -euo pipefail
+S=${FAKE_STATE:?FAKE_STATE no definido}
+printf 'curl %s\n' "$*" >> "$S/curl.log"
+svc=$(cat "$S/health_service")
+id=$(awk -F'\t' -v s="$svc" '$2 == s { print $4; exit }' "$S/containers.tsv")
+[ -n "$id" ] || exit 7
+grep -qxF -- "$id" "$S/healthy" || exit 22

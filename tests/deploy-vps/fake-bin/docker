@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# docker falso para tests/deploy-vps/run.sh. Simula, sobre ficheros de texto en
+# $FAKE_STATE, lo que usa el script remoto de deploy-vps.yml:
+#
+#   compose.tsv     servicio <TAB> plantilla de imagen ({VAR} = ${VAR:-latest})
+#   registry.tsv    referencia <TAB> id publicado (lo que `pull` puede descargar)
+#   tags.tsv        referencia <TAB> id (etiquetas locales del VPS)
+#   ids             ids de imagen presentes en el VPS (también las colgantes)
+#   containers.tsv  id contenedor <TAB> servicio <TAB> referencia <TAB> id imagen
+#   calls.log       una línea por invocación: directorio, COMPOSE_FILE y argumentos
+#
+# Fallos inyectables: FAKE_PULL_FAIL=all|partial (partial descarga el primer
+# servicio y falla en el segundo), FAKE_UP_FAIL=N (el N-ésimo `up -d` falla tras
+# borrar el contenedor viejo del primer servicio) y FAKE_NO_CONFIG_IMAGES=1
+# (Compose sin `config --images`).
+#
+# Cualquier otra orden termina con 99: si el script remoto empieza a usar algo
+# nuevo, la prueba falla en vez de pasar en silencio.
+set -euo pipefail
+S=${FAKE_STATE:?FAKE_STATE no definido}
+printf 'cwd=%s COMPOSE_FILE=%s :: docker %s\n' "$PWD" "${COMPOSE_FILE-}" "$*" >> "$S/calls.log"
+
+die() { echo "docker falso: orden no simulada: docker $*" >&2; exit 99; }
+err() { echo "Error response from daemon: $*" >&2; exit 1; }
+
+# Clave -> valor (segunda columna) de un .tsv.
+get() { awk -F'\t' -v k="$2" '$1 == k { print $2; exit }' "$1"; }
+put() {
+  local tmp
+  tmp=$(mktemp "$S/tmp.XXXXXX")
+  awk -F'\t' -v k="$2" '$1 != k' "$1" > "$tmp"
+  printf '%s\t%s\n' "$2" "$3" >> "$tmp"
+  mv "$tmp" "$1"
+}
+# Sin etiqueta, Docker entiende :latest (el puerto de un registro no es etiqueta).
+norm() { case "${1##*/}" in *:*) printf '%s\n' "$1" ;; *) printf '%s:latest\n' "$1" ;; esac; }
+# Interpola una plantilla con el entorno, como Compose con ${VAR:-latest}.
+resolve() {
+  local t=$1 var
+  while [[ $t =~ \{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    var=${BASH_REMATCH[1]}
+    t=${t//"{$var}"/${!var:-latest}}
+  done
+  printf '%s\n' "$t"
+}
+image_of() {
+  local t
+  t=$(get "$S/compose.tsv" "$1")
+  [ -n "$t" ] || { echo "no such service: $1" >&2; exit 1; }
+  resolve "$t"
+}
+# Servicios indicados o, sin argumentos, todos.
+services() { if [ "$#" -gt 0 ]; then printf '%s\n' "$@"; else cut -f1 "$S/compose.tsv"; fi; }
+have_id() { grep -qxF -- "$1" "$S/ids"; }
+add_id() { have_id "$1" || printf '%s\n' "$1" >> "$S/ids"; }
+
+compose() {
+  local sub=${1:-}
+  shift || true
+  case "$sub" in
+    ps)
+      [ "${1:-}" = -q ] || die compose ps "$@"
+      shift
+      local svc
+      for svc in $(services "$@"); do
+        awk -F'\t' -v s="$svc" '$2 == s { print $1 }' "$S/containers.tsv"
+      done
+      ;;
+    config)
+      [ "${1:-}" = --images ] || die compose config "$@"
+      shift
+      [ -z "${FAKE_NO_CONFIG_IMAGES:-}" ] || { echo "unknown flag: --images" >&2; exit 1; }
+      local svc
+      for svc in $(services "$@"); do image_of "$svc"; done
+      ;;
+    pull)
+      local svc ref id n=0
+      for svc in $(services "$@"); do
+        n=$((n + 1))
+        case "${FAKE_PULL_FAIL:-}" in
+          all) err "pull simulado fallido ($svc)" ;;
+          partial) [ "$n" -lt 2 ] || err "pull simulado fallido ($svc)" ;;
+        esac
+        ref=$(norm "$(image_of "$svc")")
+        id=$(get "$S/registry.tsv" "$ref")
+        [ -n "$id" ] || err "manifest for $ref not found: manifest unknown"
+        put "$S/tags.tsv" "$ref" "$id"
+        add_id "$id"
+        echo " $svc Pulled"
+      done
+      ;;
+    up)
+      [ "${1:-}" = -d ] || die compose up "$@"
+      shift
+      local svc ref id n
+      n=$(($(cat "$S/up_count" 2>/dev/null || echo 0) + 1))
+      echo "$n" > "$S/up_count"
+      for svc in $(services "$@"); do
+        ref=$(norm "$(image_of "$svc")")
+        id=$(get "$S/tags.tsv" "$ref")
+        if [ -z "$id" ]; then # pull_policy: missing
+          id=$(get "$S/registry.tsv" "$ref")
+          [ -n "$id" ] || err "No such image: $ref"
+          put "$S/tags.tsv" "$ref" "$id"
+          add_id "$id"
+        fi
+        # Recrear: el contenedor viejo se borra antes de arrancar el nuevo.
+        awk -F'\t' -v s="$svc" '$2 != s' "$S/containers.tsv" > "$S/containers.tmp"
+        mv "$S/containers.tmp" "$S/containers.tsv"
+        [ "${FAKE_UP_FAIL:-}" != "$n" ] || err "failed to start container for $svc (simulado)"
+        printf 'c%s-%s\t%s\t%s\t%s\n' "$n" "$svc" "$svc" "$ref" "$id" >> "$S/containers.tsv"
+        echo " Container $svc Started"
+      done
+      ;;
+    logs) echo "(logs simulados: $*)" ;;
+    *) die compose "$sub" "$@" ;;
+  esac
+}
+
+case "${1:-}" in
+  compose) shift; compose "$@" ;;
+  inspect)
+    [ "${2:-}" = --format ] && [ "$#" -eq 4 ] || die "$@"
+    line=$(awk -F'\t' -v c="$4" '$1 == c' "$S/containers.tsv")
+    [ -n "$line" ] || err "No such object: $4"
+    case "$3" in
+      '{{.Config.Image}}') cut -f3 <<< "$line" ;;
+      '{{.Image}}') cut -f4 <<< "$line" ;;
+      *) die "$@" ;;
+    esac
+    ;;
+  tag)
+    [ "$#" -eq 3 ] || die "$@"
+    case "$2" in
+      sha256:*) have_id "$2" || err "No such image: $2"; id=$2 ;;
+      *) id=$(get "$S/tags.tsv" "$(norm "$2")"); [ -n "$id" ] || err "No such image: $2" ;;
+    esac
+    put "$S/tags.tsv" "$(norm "$3")" "$id"
+    ;;
+  image)
+    [ "${2:-}" = prune ] && [ "${3:-}" = -f ] || die "$@"
+    # Solo las colgantes: sin etiqueta y sin contenedor.
+    tmp=$(mktemp "$S/tmp.XXXXXX")
+    while IFS= read -r id; do
+      if cut -f2 "$S/tags.tsv" | grep -qxF -- "$id" || cut -f4 "$S/containers.tsv" | grep -qxF -- "$id"; then
+        printf '%s\n' "$id"
+      fi
+    done < "$S/ids" > "$tmp"
+    mv "$tmp" "$S/ids"
+    echo "Total reclaimed space: 0B"
+    ;;
+  *) die "$@" ;;
+esac
