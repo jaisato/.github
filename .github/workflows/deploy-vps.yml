@@ -4,6 +4,9 @@
 # el VPS (`:latest` local y $COMPOSE_PATH/.deploy-image-tag) para que un
 # `docker compose up -d` manual posterior no vuelva a una imagen antigua.
 #
+# Su lógica se prueba sin VPS con tests/deploy-vps/run.sh (ssh, docker y curl
+# falsos sobre el script de este mismo fichero).
+#
 # Lo invoca cada repositorio (normalmente tras publicar la imagen) con:
 #   jobs:
 #     deploy:

@@ -356,6 +356,23 @@ Los workflows se validan con [actionlint](https://github.com/rhysd/actionlint)
 uvx --from actionlint-py actionlint .github/workflows/*.yml
 ```
 
-`deploy-vps` no puede ejecutarse en CI de este repositorio: necesita un VPS real
-y sus secretos. Su lógica se verifica con actionlint/shellcheck y en el primer
-despliegue del repositorio que lo adopte.
+Si shellcheck no está instalado, actionlint omite esa revisión sin avisar; con
+`uvx --with shellcheck-py --from actionlint-py actionlint ...` la incluye.
+
+`deploy-vps` no puede ejecutarse en CI contra un VPS real. Su lógica se prueba
+con [`tests/deploy-vps/run.sh`](tests/deploy-vps/run.sh) (job
+`deploy-vps-tests` de `lint.yml`), que extrae del workflow el script del paso
+de despliegue y lo ejecuta tal cual con `ssh`, `docker` y `curl` falsos
+([`tests/deploy-vps/fake-bin`](tests/deploy-vps/fake-bin)). Estos simulan
+contenedores, etiquetas locales y registro sobre ficheros de texto. Cubre
+despliegue correcto, health KO, `up -d` KO a medias, rollback fallido, pull KO
+(también parcial), `tag: latest`, varias imágenes con la misma variable de
+etiqueta, primer despliegue, un compose que no usa la variable y Compose sin
+`config --images`. Cada escenario
+comprueba la imagen de cada contenedor, el `:latest` local, `.deploy-image-tag`,
+el código de salida y lo que haría después un `docker compose up -d` manual.
+También pasa shellcheck al script que recibe el VPS. En local:
+
+```bash
+bash tests/deploy-vps/run.sh
+```

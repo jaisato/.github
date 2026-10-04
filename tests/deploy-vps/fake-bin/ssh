@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ssh falso para tests/deploy-vps/run.sh: comprueba que el paso usa la
+# configuración generada (-F) y el comando remoto `bash -s`, y ejecuta el script
+# que llega por stdin en local, desde $HOME como haría la sesión SSH. Guarda una
+# copia en $FAKE_STATE/remote-deploy.sh para pasarle shellcheck.
+set -euo pipefail
+S=${FAKE_STATE:?FAKE_STATE no definido}
+if [ "${1:-}" != -F ] || [ ! -f "${2:-}" ]; then
+  echo "ssh falso: se esperaba -F <config>" >&2
+  exit 98
+fi
+if [ "${*: -1}" != "bash -s" ]; then
+  echo "ssh falso: comando remoto inesperado: ${*: -1}" >&2
+  exit 98
+fi
+cd "$HOME"
+tee "$S/remote-deploy.sh" | bash -s
