@@ -120,7 +120,7 @@ compose() {
 case "${1:-}" in
   compose) shift; compose "$@" ;;
   inspect)
-    [ "${2:-}" = --format ] && [ "$#" -eq 4 ] || die "$@"
+    if [ "${2:-}" != --format ] || [ "$#" -ne 4 ]; then die "$@"; fi
     line=$(awk -F'\t' -v c="$4" '$1 == c' "$S/containers.tsv")
     [ -n "$line" ] || err "No such object: $4"
     case "$3" in
@@ -138,7 +138,7 @@ case "${1:-}" in
     put "$S/tags.tsv" "$(norm "$3")" "$id"
     ;;
   image)
-    [ "${2:-}" = prune ] && [ "${3:-}" = -f ] || die "$@"
+    if [ "${2:-}" != prune ] || [ "${3:-}" != -f ]; then die "$@"; fi
     # Solo las colgantes: sin etiqueta y sin contenedor.
     tmp=$(mktemp "$S/tmp.XXXXXX")
     while IFS= read -r id; do
