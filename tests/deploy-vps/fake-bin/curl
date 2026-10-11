@@ -10,3 +10,8 @@ svc=$(cat "$S/health_service")
 id=$(awk -F'\t' -v s="$svc" '$2 == s { print $4; exit }' "$S/containers.tsv")
 [ -n "$id" ] || exit 7
 grep -qxF -- "$id" "$S/healthy" || exit 22
+status=200
+if [ "$id" = sha256:app120 ]; then status=${FAKE_HTTP_STATUS:-200}; fi
+# curl -f succeeds for redirects, and --write-out prints the status when asked.
+case " $* " in *' --write-out '*) printf '%s' "$status" ;; esac
+[ "$status" -lt 400 ] || exit 22
