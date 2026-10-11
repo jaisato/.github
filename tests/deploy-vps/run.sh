@@ -346,6 +346,25 @@ check ":latest local apunta a 1.2.0 (solo la entrada image)" tag_is ghcr.io/jais
 check ".deploy-image-tag = 1.2.0" tag_file 1.2.0
 done_scenario
 
+# A healthy process may still serve a redirect/login page instead of health 2xx.
+for status in 301 302 304 307 308; do
+  scenario "health-redirect-$status"
+  base_app
+  healthy sha256:app110 sha256:app120
+  deploy 1.2.0 SERVICES="api worker" FAKE_HTTP_STATUS="$status"
+  check "rechaza HTTP $status" exit_code 1
+  check "restaura api" runs api sha256:app110
+  check "verifica rollback" said "Rollback verificado"
+  done_scenario
+done
+scenario health-204
+base_app
+healthy sha256:app110 sha256:app120
+deploy 1.2.0 SERVICES="api worker" FAKE_HTTP_STATUS=204
+check "acepta HTTP 204" exit_code 0
+check "mantiene la nueva imagen" runs api sha256:app120
+done_scenario
+
 # --- shellcheck del script que recibe el VPS --------------------------------
 echo "== shellcheck del script remoto"
 if command -v shellcheck > /dev/null; then
