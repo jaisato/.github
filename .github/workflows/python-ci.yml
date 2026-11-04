@@ -78,6 +78,15 @@ on:
         description: "Argumentos de pip-audit (p. ej. `-r requirements.lock`). Vacío: audita el entorno instalado."
         type: string
         default: ""
+      pip-audit-ignore-file:
+        description: >-
+          Fichero del repositorio (ruta relativa a working-directory) con los avisos triados: un
+          aviso por línea con sus identificadores (GHSA-…, CVE-…, PYSEC-…) separados por espacios,
+          y «#» abre un comentario. Si se indica, se instala el entorno aunque haya pip-audit-args,
+          pip-audit emite JSON y solo fallan los avisos que no estén en el fichero; un triado que
+          ya no aparece sale como aviso. Vacío: pip-audit tal cual.
+        type: string
+        default: ""
       pip-audit-strict:
         description: "Si es true, una vulnerabilidad hace fallar el job; si no, solo se avisa."
         type: boolean
@@ -302,8 +311,10 @@ jobs:
           cache: pip
           cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
+      # Con pip-audit-ignore-file se audita el entorno instalado aunque haya
+      # pip-audit-args (que entonces son argumentos extra, como --skip-editable).
       - name: Instalar dependencias (solo si se audita el entorno)
-        if: inputs.pip-audit-args == ''
+        if: inputs.pip-audit-args == '' || inputs.pip-audit-ignore-file != ''
         env:
           INSTALL_COMMAND: ${{ inputs.install-command }}
         run: |
@@ -326,6 +337,7 @@ jobs:
       # Con pip-audit-strict=false una CVE sin parche aguas arriba no bloquea el
       # resto del CI, pero queda visible como aviso en el job.
       - name: pip-audit
+        if: inputs.pip-audit-ignore-file == ''
         continue-on-error: ${{ !inputs.pip-audit-strict }}
         env:
           PIP_AUDIT_ARGS: ${{ inputs.pip-audit-args }}
@@ -333,6 +345,113 @@ jobs:
           pip install pip-audit
           read -ra extra <<< "$PIP_AUDIT_ARGS"
           pip-audit --progress-spinner off "${extra[@]}"
+
+      # Con pip-audit-ignore-file, el mismo pip-audit con el informe en JSON y
+      # los avisos triados aparte. Cada línea con contenido del fichero es un
+      # aviso: sus identificadores (el que da pip-audit y sus alias: GHSA, CVE,
+      # PYSEC) separados por espacios, y «#» abre un comentario. Un aviso cuenta
+      # como triado si cualquiera de sus identificadores o alias está en el
+      # fichero (pip-audit puede dar el CVE donde el fichero tiene el GHSA, o al
+      # revés); nada se pasa como --ignore-vuln. Los no triados salen como
+      # ::error:: con la versión que los corrige y ponen el paso en rojo; una
+      # línea cuyos identificadores ya no aparecen (la versión instalada los
+      # corrige) sale como ::warning:: sobre esa línea, para quitarla. Si
+      # pip-audit no llega a escribir el informe (sin red, servicio caído), el
+      # paso falla con su código. pip-audit-strict decide, como arriba, si el
+      # rojo del paso se propaga al job.
+      - name: pip-audit (avisos triados aparte)
+        if: inputs.pip-audit-ignore-file != ''
+        continue-on-error: ${{ !inputs.pip-audit-strict }}
+        env:
+          PIP_AUDIT_ARGS: ${{ inputs.pip-audit-args }}
+          PIP_AUDIT_IGNORE_FILE: ${{ inputs.pip-audit-ignore-file }}
+        run: |
+          set -euo pipefail
+          pip install pip-audit
+          read -ra extra <<< "$PIP_AUDIT_ARGS"
+          informe="$RUNNER_TEMP/pip-audit.json"
+          rc=0
+          pip-audit --progress-spinner off -f json -o "$informe" "${extra[@]}" || rc=$?
+          if [ ! -s "$informe" ]; then
+            echo "::error::pip-audit ha terminado con código $rc sin escribir el informe"
+            exit "$(( rc == 0 ? 1 : rc ))"
+          fi
+          python - "$informe" "$PIP_AUDIT_IGNORE_FILE" <<'PY'
+          import json, os, sys
+
+          informe, lista = sys.argv[1], sys.argv[2]
+
+
+          def anota(tipo, mensaje, **params):
+              # Comandos de workflow: %, CR y LF se escapan en el mensaje; en los
+              # parámetros (file, line), también «:» y «,».
+              def esc(texto, extra=""):
+                  texto = str(texto).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  for c in extra:
+                      texto = texto.replace(c, "%%%02X" % ord(c))
+                  return texto
+
+              cabecera = ",".join(f"{k}={esc(v, ':,')}" for k, v in params.items())
+              print(f"::{tipo}{' ' + cabecera if cabecera else ''}::{esc(mensaje)}")
+
+
+          try:
+              with open(lista, encoding="utf-8-sig") as f:
+                  lineas = f.read().splitlines()
+          except OSError as e:
+              anota("error", f"pip-audit: no se puede leer la lista de avisos triados ({lista}): {e.strerror}")
+              sys.exit(1)
+
+          # Una entrada por línea con contenido: sus identificadores tal cual y, para
+          # comparar, en mayúsculas.
+          triados = []
+          for n, linea in enumerate(lineas, 1):
+              ids = linea.split("#", 1)[0].split()
+              if ids:
+                  triados.append({"linea": n, "ids": ids, "clave": {i.upper() for i in ids}, "vistos": 0})
+
+          with open(informe, encoding="utf-8") as f:
+              datos = json.load(f)
+
+          con_triaje, sin_triar, omitidos = [], [], []
+          for dep in datos.get("dependencies") or []:
+              # Las dependencias omitidas no llevan versión (va dentro del motivo).
+              nombre, version = dep.get("name", "?"), dep.get("version")
+              paquete = f"{nombre} {version}" if version else nombre
+              if dep.get("skip_reason"):
+                  omitidos.append(f"{paquete}: {dep['skip_reason']}")
+              for v in dep.get("vulns") or []:
+                  ids = [i for i in [v.get("id")] + list(v.get("aliases") or []) if i]
+                  clave = {i.upper() for i in ids}
+                  corregido = ", ".join(v.get("fix_versions") or [])
+                  texto = f"{paquete}: {' / '.join(ids)}, " + (f"corregido en {corregido}" if corregido else "sin versión corregida")
+                  entradas = [t for t in triados if t["clave"] & clave]
+                  for t in entradas:
+                      t["vistos"] += 1
+                  if entradas:
+                      con_triaje.append(f"{texto} (línea {', '.join(str(t['linea']) for t in entradas)})")
+                  else:
+                      descripcion = (v.get("description") or "").strip().splitlines() or [""]
+                      sin_triar.append((texto, descripcion[0][:160]))
+
+          for texto in con_triaje:
+              print(f"triado    {texto}")
+          for texto in omitidos:
+              print(f"omitido   {texto}")
+          for texto, descripcion in sin_triar:
+              print(f"SIN TRIAR {texto}")
+              if descripcion:
+                  print(f"          {descripcion}")
+              anota("error", f"pip-audit: {texto}. Sin triar en {lista}")
+          raiz = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+          for t in triados:
+              if not t["vistos"]:
+                  anota("warning", f"pip-audit: {' '.join(t['ids'])} ya no aparece: quítalo de {lista} (línea {t['linea']})",
+                        file=os.path.relpath(os.path.abspath(lista), raiz), line=t["linea"])
+          total = len(con_triaje) + len(sin_triar)
+          print(f"pip-audit: {total} avisos; {len(con_triaje)} triados aparte ({lista}), {len(sin_triar)} sin triar")
+          sys.exit(1 if sin_triar else 0)
+          PY
 
   docker:
     name: Build de validación de la imagen (sin push)
