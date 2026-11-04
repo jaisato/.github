@@ -415,14 +415,16 @@ jobs:
 
           con_triaje, sin_triar, omitidos = [], [], []
           for dep in datos.get("dependencies") or []:
-              nombre, version = dep.get("name", "?"), dep.get("version", "?")
+              # Las dependencias omitidas no llevan versión (va dentro del motivo).
+              nombre, version = dep.get("name", "?"), dep.get("version")
+              paquete = f"{nombre} {version}" if version else nombre
               if dep.get("skip_reason"):
-                  omitidos.append(f"{nombre} {version}: {dep['skip_reason']}")
+                  omitidos.append(f"{paquete}: {dep['skip_reason']}")
               for v in dep.get("vulns") or []:
                   ids = [i for i in [v.get("id")] + list(v.get("aliases") or []) if i]
                   clave = {i.upper() for i in ids}
                   corregido = ", ".join(v.get("fix_versions") or [])
-                  texto = f"{nombre} {version}: {' / '.join(ids)}, " + (f"corregido en {corregido}" if corregido else "sin versión corregida")
+                  texto = f"{paquete}: {' / '.join(ids)}, " + (f"corregido en {corregido}" if corregido else "sin versión corregida")
                   entradas = [t for t in triados if t["clave"] & clave]
                   for t in entradas:
                       t["vistos"] += 1
