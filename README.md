@@ -35,8 +35,9 @@ organización con un plan que lo permita).
 
 Jobs: `lint` (ruff check + `ruff format --check`), `types` (mypy, opcional),
 `tests` (matriz de versiones de Python, cobertura mínima opcional), `audit`
-(pip-audit, opcional) y `docker` (build de validación sin push, opcional). La
-caché de pip la gestiona `actions/setup-python`.
+(pip-audit, opcional, con una [lista de avisos triados](#avisos-triados-en-pip-audit)
+si se indica) y `docker` (build de validación sin push, opcional). La caché de
+pip la gestiona `actions/setup-python`.
 
 ### Entradas
 
@@ -56,6 +57,7 @@ caché de pip la gestiona `actions/setup-python`.
 | `extra-test-args` | string | `""` | Argumentos extra para pytest. |
 | `run-pip-audit` | boolean | `false` | Ejecutar pip-audit. |
 | `pip-audit-args` | string | `""` | Por ejemplo `-r requirements.lock`. Vacío: audita el entorno instalado con `install-command`. |
+| `pip-audit-ignore-file` | string | `""` | Fichero del repositorio (relativo a `working-directory`) con los [avisos triados](#avisos-triados-en-pip-audit): un aviso por línea con sus identificadores (`GHSA-…`, `CVE-…`, `PYSEC-…`) separados por espacios, y `#` abre un comentario. Si se indica, se instala el entorno aunque haya `pip-audit-args` y solo fallan los avisos que no estén en la lista. |
 | `pip-audit-strict` | boolean | `false` | Con `false` una vulnerabilidad deja un aviso pero no rompe el CI. |
 | `docker-build` | boolean | `false` | Construir la imagen sin publicarla (caché de capas en GHA). |
 | `docker-context` | string | `working-directory` | Contexto del build. |
@@ -64,6 +66,37 @@ caché de pip la gestiona `actions/setup-python`.
 Si ruff, mypy, pytest o pytest-cov no quedan instalados por `install-command`,
 el workflow instala la última versión publicada. Para resultados reproducibles
 conviene fijarlos en las dependencias de desarrollo del proyecto.
+
+### Avisos triados en pip-audit
+
+Un aviso que no se puede corregir (la versión arreglada no cabe por el techo de
+otra dependencia, o el código afectado no se usa) tapa, run tras run, cualquier
+aviso nuevo. Con `pip-audit-ignore-file` se deja aparte sin dejar de auditar el
+entorno real y sin `--ignore-vuln`:
+
+```text
+# .github/pip-audit-ignore.txt: un aviso por línea, con su motivo y cuándo revisarlo
+GHSA-v4x8-3wr5-3wq8 CVE-2026-112940  # filelock: litellm fija filelock<4.0; revisar al subir litellm
+```
+
+- Cada línea con contenido es un aviso; sus identificadores (el que da pip-audit
+  y sus alias) van separados por espacios, `#` abre un comentario y las
+  mayúsculas no cuentan. Un aviso está triado si cualquiera de sus
+  identificadores o alias aparece en el fichero: da igual que pip-audit informe
+  del CVE y el fichero tenga el GHSA, o al revés.
+- El job instala el entorno con `install-command` aunque haya `pip-audit-args`
+  (que se añaden a la llamada: `--skip-editable`, `--vulnerability-service osv`…)
+  y ejecuta `pip-audit -f json`.
+- Los avisos sin triar salen como `::error::` con la versión que los corrige y
+  ponen el paso en rojo; `pip-audit-strict` decide, como sin lista, si eso rompe
+  el job. Los triados y las dependencias que pip-audit no pudo auditar se listan
+  en el log, y la última línea resume: `pip-audit: N avisos; T triados aparte
+  (<fichero>), S sin triar`.
+- Una línea cuyos identificadores ya no aparecen (la versión instalada los
+  corrige) sale como `::warning::` sobre esa línea del fichero: es la señal de
+  borrarla y fijar en las dependencias la versión que corrige el aviso.
+- Si pip-audit no llega a escribir el informe (sin red, servicio caído) el paso
+  falla con su código, igual que sin lista.
 
 ### Ejemplo de caller
 
